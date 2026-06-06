@@ -629,35 +629,118 @@
     }
 
     // --- ระบบตรวจสอบคณิตศาสตร์ (CortexJS Compute Engine) ---
-    function checkMathEqual(val1, val2) {
-        // เช็คว่าโหลด ComputeEngine Module สำเร็จหรือไม่
-        if (window.ce) {
-            try {
-                // วิเคราะห์ประโยค LaTeX ทางคณิตศาสตร์
-                let expr1 = window.ce.parse(val1);
-                let expr2 = window.ce.parse(val2);
-                
-                // .isEqual() จะรู้ว่า x+y = y+x หรือ \frac{1}{2} = \frac{2}{4}
-                if (expr1.isSame(expr2) || expr1.isEqual(expr2)) {
-                    return true;
-                }
-            } catch(err) {
-                console.warn("ComputeEngine Parse Fallback:", err);
-            }
+    // --- ระบบตรวจสอบคณิตศาสตร์ (Numerical Equivalence + CortexJS) ---
+function checkMathEqual(val1, val2) {
+    if (!val1 || !val2) return false;
+
+    // ✅ ขั้นที่ 1: ลองใช้ CortexJS simplify + canonical comparison
+    if (window.ce) {
+        try {
+            let s1 = window.ce.parse(val1).simplify().canonical;
+            let s2 = window.ce.parse(val2).simplify().canonical;
+            if (s1 && s2 && s1.isSame(s2)) return true;
+        } catch(e) {
+            console.warn("CortexJS canonical compare failed:", e);
         }
-        
-        // ถ้าเกิด Error ใน Library ให้กลับมาเทียบแบบตัดเว้นวรรคปกติ
-        let n1 = normalizeLatex(val1);
-        let n2 = normalizeLatex(val2);
-        return n1 === n2;
     }
 
-    function normalizeLatex(str) {
-        return str.replace(/ /g, '')
-                  .replace(/\\left/g, '').replace(/\\right/g, '')
-                  .replace(/\{/g, '').replace(/\}/g, '')
-                  .replace(/\(/g, '').replace(/\)/g, '');
+    // ✅ ขั้นที่ 2: Numerical Equivalence Testing
+    // แปลง LaTeX → JavaScript expression แล้วทดสอบด้วยค่าสุ่มหลายชุด
+    // วิธีนี้รับมือ commutative (a+b = b+a, a*b = b*a) ได้แน่นอน
+    try {
+        let jsExpr1 = latexToJS(val1);
+        let jsExpr2 = latexToJS(val2);
+        
+        // หาตัวแปรทั้งหมดที่ใช้ใน expression
+        let vars = extractVars(jsExpr1 + " " + jsExpr2);
+        
+        // ทดสอบ 5 ชุดค่าสุ่ม ถ้าผ่านทั้งหมดถือว่าเท่ากัน
+        let testCases = 5;
+        let passed = 0;
+        for (let t = 0; t < testCases; t++) {
+            let env = {};
+            // กำหนดค่าตัวแปรแบบสุ่ม (หลีกเลี่ยง 0 เพราะอาจทำ division by zero)
+            vars.forEach(v => { env[v] = (Math.random() * 8 + 1).toFixed(4) * 1; });
+            
+            let result1 = evalWithVars(jsExpr1, env);
+            let result2 = evalWithVars(jsExpr2, env);
+            
+            if (result1 === null || result2 === null) break;
+            // เปรียบเทียบด้วย tolerance (รับมือ floating point error)
+            if (Math.abs(result1 - result2) < 1e-9 * (Math.abs(result1) + 1)) {
+                passed++;
+            }
+        }
+        if (passed === testCases) return true;
+    } catch(e) {
+        console.warn("Numerical test failed:", e);
     }
+
+    // ✅ ขั้นที่ 3: Fallback — normalize LaTeX แล้วเทียบตัวอักษร
+    return normalizeLatex(val1) === normalizeLatex(val2);
+}
+
+// แปลง LaTeX → JavaScript expression string
+function latexToJS(latex) {
+    return latex
+        // ตัดสัญลักษณ์ LaTeX ที่ไม่ต้องการ
+        .replace(/\\left/g, '').replace(/\\right/g, '')
+        .replace(/\\cdot/g, '*').replace(/\\times/g, '*')
+        .replace(/\\div/g, '/')
+        // เศษส่วน: \frac{a}{b} → (a)/(b)
+        .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, (_, n, d) => `((${latexToJS(n)})/(${latexToJS(d)}))`)
+        // sqrt: \sqrt{x} → Math.sqrt(x)
+        .replace(/\\sqrt\{([^{}]*)\}/g, (_, x) => `Math.sqrt(${latexToJS(x)})`)
+        // ยกกำลัง: x^{n} → Math.pow(x, n)
+        .replace(/\^\{([^{}]*)\}/g, (_, n) => `**(${n})`)
+        .replace(/\^(\w)/g, (_, n) => `**(${n})`)
+        // pi
+        .replace(/\\pi/g, 'Math.PI')
+        // ตัวอักษรกรีก → ชื่อตัวแปรที่ปลอดภัย
+        .replace(/\\alpha/g, '_alpha').replace(/\\beta/g, '_beta')
+        .replace(/\\gamma/g, '_gamma').replace(/\\delta/g, '_delta')
+        .replace(/\\theta/g, '_theta').replace(/\\omega/g, '_omega')
+        .replace(/\\mu/g, '_mu').replace(/\\sigma/g, '_sigma')
+        .replace(/\\lambda/g, '_lambda').replace(/\\rho/g, '_rho')
+        // subscript: T_1 → T1, T_{12} → T12
+        .replace(/([A-Za-z_]+)_\{(\w+)\}/g, '$1$2')
+        .replace(/([A-Za-z_]+)_(\w)/g, '$1$2')
+        // ลบ {} ที่เหลือ
+        .replace(/[{}]/g, '')
+        // implicit multiplication: 2x → 2*x, 3T1 → 3*T1
+        .replace(/(\d)([A-Za-z_])/g, '$1*$2')
+        .replace(/([A-Za-z_])(\d)/g, '$1*$2');
+}
+
+// หาชื่อตัวแปรทั้งหมดใน expression (ยกเว้น Math.xxx)
+function extractVars(expr) {
+    let matches = expr.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || [];
+    let reserved = new Set(['Math', 'PI', 'sqrt', 'pow', 'abs', 'sin', 'cos', 'tan', 'log', 'exp']);
+    return [...new Set(matches.filter(v => !reserved.has(v)))];
+}
+
+// แทนค่าตัวแปรแล้ว eval
+function evalWithVars(expr, env) {
+    try {
+        let code = expr;
+        // เรียงจากยาวสุดก่อนเพื่อหลีกเลี่ยง partial replace
+        let varNames = Object.keys(env).sort((a,b) => b.length - a.length);
+        varNames.forEach(v => {
+            code = code.replace(new RegExp('\\b' + v.replace(/[_]/g, '\\_') + '\\b', 'g'), env[v]);
+        });
+        let result = eval(code); // eslint-disable-line no-eval
+        return (isFinite(result) && !isNaN(result)) ? result : null;
+    } catch(e) {
+        return null;
+    }
+}
+
+function normalizeLatex(str) {
+    return str.replace(/ /g, '')
+              .replace(/\\left/g, '').replace(/\\right/g, '')
+              .replace(/\{/g, '').replace(/\}/g, '')
+              .replace(/\(/g, '').replace(/\)/g, '');
+}
 
     function notify(text, color) {
         let box = document.getElementById('notif-box');
