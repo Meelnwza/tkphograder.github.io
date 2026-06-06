@@ -633,113 +633,182 @@
 function checkMathEqual(val1, val2) {
     if (!val1 || !val2) return false;
 
-    // ✅ ขั้นที่ 1: ลองใช้ CortexJS simplify + canonical comparison
+    // ขั้นที่ 1: CortexJS canonical comparison (จับ simplification อัตโนมัติ)
     if (window.ce) {
         try {
+            // .simplify().canonical ทำให้ 4T1+T2 และ T2+4T1 collapse เป็นรูปเดียวกัน
             let s1 = window.ce.parse(val1).simplify().canonical;
             let s2 = window.ce.parse(val2).simplify().canonical;
             if (s1 && s2 && s1.isSame(s2)) return true;
-        } catch(e) {
-            console.warn("CortexJS canonical compare failed:", e);
-        }
-    }
+        } catch(e) { console.warn("CortexJS canonical failed:", e); }
 
-    // ✅ ขั้นที่ 2: Numerical Equivalence Testing
-    // แปลง LaTeX → JavaScript expression แล้วทดสอบด้วยค่าสุ่มหลายชุด
-    // วิธีนี้รับมือ commutative (a+b = b+a, a*b = b*a) ได้แน่นอน
-    try {
-        let jsExpr1 = latexToJS(val1);
-        let jsExpr2 = latexToJS(val2);
-        
-        // หาตัวแปรทั้งหมดที่ใช้ใน expression
-        let vars = extractVars(jsExpr1 + " " + jsExpr2);
-        
-        // ทดสอบ 5 ชุดค่าสุ่ม ถ้าผ่านทั้งหมดถือว่าเท่ากัน
-        let testCases = 5;
-        let passed = 0;
-        for (let t = 0; t < testCases; t++) {
-            let env = {};
-            // กำหนดค่าตัวแปรแบบสุ่ม (หลีกเลี่ยง 0 เพราะอาจทำ division by zero)
-            vars.forEach(v => { env[v] = (Math.random() * 8 + 1).toFixed(4) * 1; });
+        // ขั้นที่ 2: CortexJS numerical substitution
+        // ให้ CortexJS หาตัวแปรทั้งหมด แล้ว substitute ค่าตัวเลขลงไปตรงๆ
+        // วิธีนี้รองรับ T_1 - \frac{1}{5}(T_1 - T_2) = \frac{4T_1+T_2}{5} ได้แน่นอน
+        try {
+            let expr1 = window.ce.parse(val1);
+            let expr2 = window.ce.parse(val2);
             
-            let result1 = evalWithVars(jsExpr1, env);
-            let result2 = evalWithVars(jsExpr2, env);
+            // หาชื่อตัวแปร free symbols ทั้งหมดจากทั้งสอง expression
+            let sym1 = getFreeVars(expr1);
+            let sym2 = getFreeVars(expr2);
+            let allVars = [...new Set([...sym1, ...sym2])];
             
-            if (result1 === null || result2 === null) break;
-            // เปรียบเทียบด้วย tolerance (รับมือ floating point error)
-            if (Math.abs(result1 - result2) < 1e-9 * (Math.abs(result1) + 1)) {
-                passed++;
+            // ทดสอบ 7 ชุดค่าสุ่ม
+            let passed = 0;
+            const TESTS = 7;
+            for (let t = 0; t < TESTS; t++) {
+                // สร้าง substitution scope: ค่าสุ่มไม่ซ้ำกัน หลีกเลี่ยง 0
+                let scope = {};
+                allVars.forEach(v => {
+                    scope[v] = (Math.random() * 9 + 1);  // 1..10
+                });
+                
+                // Substitute โดย CortexJS โดยตรง
+                let v1 = evaluateWithScope(expr1, scope);
+                let v2 = evaluateWithScope(expr2, scope);
+                
+                if (v1 === null || v2 === null) continue;
+                // relative tolerance
+                let tol = 1e-9 * (Math.abs(v1) + Math.abs(v2) + 1);
+                if (Math.abs(v1 - v2) < tol) passed++;
             }
-        }
-        if (passed === testCases) return true;
-    } catch(e) {
-        console.warn("Numerical test failed:", e);
+            if (passed >= 6) return true;  // ผ่านอย่างน้อย 6/7 ชุด
+        } catch(e) { console.warn("CortexJS numerical failed:", e); }
     }
 
-    // ✅ ขั้นที่ 3: Fallback — normalize LaTeX แล้วเทียบตัวอักษร
+    // ขั้นที่ 3: Fallback — แปลง LaTeX → JS ด้วย regex แบบ robust
+    try {
+        let js1 = latexToJS(val1);
+        let js2 = latexToJS(val2);
+        let vars = extractLatexVars(val1 + " " + val2);
+        
+        let passed = 0;
+        const TESTS = 7;
+        for (let t = 0; t < TESTS; t++) {
+            let env = {};
+            vars.forEach(v => { env[v] = (Math.random() * 9 + 1); });
+            let r1 = evalJS(js1, env);
+            let r2 = evalJS(js2, env);
+            if (r1 === null || r2 === null) continue;
+            let tol = 1e-9 * (Math.abs(r1) + Math.abs(r2) + 1);
+            if (Math.abs(r1 - r2) < tol) passed++;
+        }
+        if (passed >= 6) return true;
+    } catch(e) { console.warn("Fallback numerical failed:", e); }
+
     return normalizeLatex(val1) === normalizeLatex(val2);
 }
 
-// แปลง LaTeX → JavaScript expression string
-function latexToJS(latex) {
-    return latex
-        // ตัดสัญลักษณ์ LaTeX ที่ไม่ต้องการ
-        .replace(/\\left/g, '').replace(/\\right/g, '')
-        .replace(/\\cdot/g, '*').replace(/\\times/g, '*')
-        .replace(/\\div/g, '/')
-        // เศษส่วน: \frac{a}{b} → (a)/(b)
-        .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, (_, n, d) => `((${latexToJS(n)})/(${latexToJS(d)}))`)
-        // sqrt: \sqrt{x} → Math.sqrt(x)
-        .replace(/\\sqrt\{([^{}]*)\}/g, (_, x) => `Math.sqrt(${latexToJS(x)})`)
-        // ยกกำลัง: x^{n} → Math.pow(x, n)
-        .replace(/\^\{([^{}]*)\}/g, (_, n) => `**(${n})`)
-        .replace(/\^(\w)/g, (_, n) => `**(${n})`)
-        // pi
-        .replace(/\\pi/g, 'Math.PI')
-        // ตัวอักษรกรีก → ชื่อตัวแปรที่ปลอดภัย
-        .replace(/\\alpha/g, '_alpha').replace(/\\beta/g, '_beta')
-        .replace(/\\gamma/g, '_gamma').replace(/\\delta/g, '_delta')
-        .replace(/\\theta/g, '_theta').replace(/\\omega/g, '_omega')
-        .replace(/\\mu/g, '_mu').replace(/\\sigma/g, '_sigma')
-        .replace(/\\lambda/g, '_lambda').replace(/\\rho/g, '_rho')
-        // subscript: T_1 → T1, T_{12} → T12
-        .replace(/([A-Za-z_]+)_\{(\w+)\}/g, '$1$2')
-        .replace(/([A-Za-z_]+)_(\w)/g, '$1$2')
-        // ลบ {} ที่เหลือ
-        .replace(/[{}]/g, '')
-        // implicit multiplication: 2x → 2*x, 3T1 → 3*T1
-        .replace(/(\d)([A-Za-z_])/g, '$1*$2')
-        .replace(/([A-Za-z_])(\d)/g, '$1*$2');
-}
-
-// หาชื่อตัวแปรทั้งหมดใน expression (ยกเว้น Math.xxx)
-function extractVars(expr) {
-    let matches = expr.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || [];
-    let reserved = new Set(['Math', 'PI', 'sqrt', 'pow', 'abs', 'sin', 'cos', 'tan', 'log', 'exp']);
-    return [...new Set(matches.filter(v => !reserved.has(v)))];
-}
-
-// แทนค่าตัวแปรแล้ว eval
-function evalWithVars(expr, env) {
+// ดึง free variable names จาก CortexJS expression
+function getFreeVars(expr) {
     try {
-        let code = expr;
-        // เรียงจากยาวสุดก่อนเพื่อหลีกเลี่ยง partial replace
-        let varNames = Object.keys(env).sort((a,b) => b.length - a.length);
-        varNames.forEach(v => {
-            code = code.replace(new RegExp('\\b' + v.replace(/[_]/g, '\\_') + '\\b', 'g'), env[v]);
-        });
-        let result = eval(code); // eslint-disable-line no-eval
-        return (isFinite(result) && !isNaN(result)) ? result : null;
+        // CortexJS เก็บ free symbols ใน .freeVariables หรือ .symbols
+        let syms = expr.freeVariables ?? expr.symbols ?? [];
+        // filter เฉพาะตัวแปร ไม่เอา constants เช่น Pi, E
+        return syms.filter(s => !['Pi','E','True','False','Nothing'].includes(s));
     } catch(e) {
-        return null;
+        return [];
     }
 }
 
+// Substitute ค่าตัวเลขลงใน CortexJS expression แล้วคำนวณ
+function evaluateWithScope(expr, scope) {
+    try {
+        // assign ค่าชั่วคราวใน ComputeEngine context
+        let assigned = window.ce.assign(scope);
+        let result = expr.N();
+        window.ce.assign({}); // reset
+        
+        if (!result) return null;
+        let num = result.numericValue;
+        if (typeof num === 'number' && isFinite(num)) return num;
+        if (num && typeof num.valueOf === 'function') {
+            let v = num.valueOf();
+            return (typeof v === 'number' && isFinite(v)) ? v : null;
+        }
+        return null;
+    } catch(e) {
+        // ถ้า .assign() ไม่ใช่ API ของ version นี้ ให้ fallback
+        try {
+            // วิธีสำรอง: แทนค่าผ่าน LaTeX string โดยตรง
+            let latex = expr.latex;
+            if (!latex) return null;
+            for (let [v, val] of Object.entries(scope)) {
+                // แทน T_1, T_2 แบบ exact match
+                let re = new RegExp('\\b' + v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+                latex = latex.replace(re, '(' + val + ')');
+            }
+            let result2 = window.ce.parse(latex).N();
+            if (!result2) return null;
+            let num2 = result2.numericValue;
+            if (typeof num2 === 'number' && isFinite(num2)) return num2;
+            return null;
+        } catch(e2) { return null; }
+    }
+}
+
+// Fallback: แปลง LaTeX → JS expression string (robust version)
+function latexToJS(latex) {
+    let s = latex;
+    // ทำซ้ำ 3 รอบเพื่อ handle nested \frac
+    for (let i = 0; i < 3; i++) {
+        s = s.replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, (_, n, d) => `((${n})/(${d}))`);
+    }
+    return s
+        .replace(/\\sqrt\[3\]\{([^{}]*)\}/g, (_, x) => `Math.cbrt(${x})`)
+        .replace(/\\sqrt\{([^{}]*)\}/g, (_, x) => `Math.sqrt(${x})`)
+        .replace(/\\left\(/g, '(').replace(/\\right\)/g, ')')
+        .replace(/\\left\[/g, '(').replace(/\\right\]/g, ')')
+        .replace(/\\cdot/g, '*').replace(/\\times/g, '*').replace(/\\div/g, '/')
+        .replace(/\\pi/g, 'Math.PI')
+        .replace(/\\alpha/g,'_al').replace(/\\beta/g,'_be').replace(/\\gamma/g,'_ga')
+        .replace(/\\delta/g,'_de').replace(/\\theta/g,'_th').replace(/\\omega/g,'_om')
+        .replace(/\\mu/g,'_mu').replace(/\\sigma/g,'_si').replace(/\\lambda/g,'_la')
+        .replace(/\\rho/g,'_rh').replace(/\\eta/g,'_et').replace(/\\tau/g,'_ta')
+        // subscript: T_{12} → T12, T_1 → T1
+        .replace(/([A-Za-z_]+)_\{([^{}]+)\}/g, '$1$2')
+        .replace(/([A-Za-z_]+)_([A-Za-z0-9])/g, '$1$2')
+        .replace(/\^\{([^{}]*)\}/g, '**($1)')
+        .replace(/\^([A-Za-z0-9])/g, '**$1')
+        .replace(/[{}]/g, '')
+        // implicit multiplication: 2x → 2*x  (ไม่ทำกับ Math.xxx)
+        .replace(/(\d)([A-Za-z_])/g, '$1*$2')
+        .replace(/([A-Za-z_])(\d)/g, '$1*$2')
+        .replace(/\)\s*\(/g, ')*(');
+}
+
+// หาตัวแปรจาก LaTeX string โดยตรง (สำหรับ fallback)
+function extractLatexVars(latex) {
+    // แปลง subscript ก่อนหาตัวแปร
+    let s = latex
+        .replace(/([A-Za-z_]+)_\{([^{}]+)\}/g, '$1$2')
+        .replace(/([A-Za-z_]+)_([A-Za-z0-9])/g, '$1$2');
+    let matches = s.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || [];
+    let reserved = new Set(['Math','PI','sqrt','cbrt','pow','abs','sin','cos','tan','log','exp',
+                            'frac','left','right','cdot','times','alpha','beta','gamma','delta',
+                            'theta','omega','mu','sigma','lambda','rho','eta','tau','pi']);
+    return [...new Set(matches.filter(v => !reserved.has(v) && !v.startsWith('Math')))];
+}
+
+// eval JS expression ด้วยค่าตัวแปร
+function evalJS(expr, env) {
+    try {
+        let code = expr;
+        let varNames = Object.keys(env).sort((a,b) => b.length - a.length);
+        varNames.forEach(v => {
+            let safe = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            code = code.replace(new RegExp('\\b' + safe + '\\b', 'g'), '(' + env[v] + ')');
+        });
+        let r = Function('"use strict"; return (' + code + ')')();
+        return (isFinite(r) && !isNaN(r)) ? r : null;
+    } catch(e) { return null; }
+}
+
 function normalizeLatex(str) {
-    return str.replace(/ /g, '')
-              .replace(/\\left/g, '').replace(/\\right/g, '')
-              .replace(/\{/g, '').replace(/\}/g, '')
-              .replace(/\(/g, '').replace(/\)/g, '');
+    return str.replace(/\s/g,'')
+              .replace(/\\left|\\right/g,'')
+              .replace(/[{}()]/g,'');
 }
 
     function notify(text, color) {
